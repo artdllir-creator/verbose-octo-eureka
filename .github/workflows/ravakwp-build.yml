@@ -1,17 +1,11 @@
 # =============================================================================
-# RavakWP App Builder — GitHub Actions Build (third engine, v1.2.0)
-# -----------------------------------------------------------------------------
-# Place this file in YOUR repository at .github/workflows/ravakwp-build.yml
-# and add three repository Secrets (Settings → Secrets and variables → Actions):
+# RavakWP App Builder — GitHub Actions Build (hardened workflow)
+# Place at .github/workflows/ravakwp-build.yml
 #
-#   RVK_SITE_URL   → https://your-store.com
-#   RVK_STORE_KEY  → store key from the plugin panel
-#   RVK_HMAC_KEY   → build HMAC key from the plugin panel
-#
-# The build is dispatched from the WordPress panel (plugin sends build_id);
-# the runner downloads its own code bundle from your site (HMAC-signed),
-# runs the SAME build pipeline as the Docker worker, and delivers APK/AAB
-# back to WordPress through the same signed callbacks. No Docker needed.
+# Required repository secrets:
+#   RVK_SITE_URL   = https://your-store.com
+#   RVK_STORE_KEY  = store key from the plugin panel
+#   RVK_HMAC_KEY   = build HMAC key from the plugin panel
 # =============================================================================
 
 name: RavakWP Build
@@ -33,12 +27,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: ravakwp-build-${{ github.event.inputs.build_id }}
+  group: ravakwp-build-${{ inputs.build_id || github.run_id }}
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Android APK/AAB (build ${{ github.event.inputs.build_id }})
+    name: Android APK/AAB (build ${{ inputs.build_id }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -47,13 +41,37 @@ jobs:
       RVK_STORE_KEY: ${{ secrets.RVK_STORE_KEY }}
       RVK_HMAC_KEY: ${{ secrets.RVK_HMAC_KEY }}
       ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_API_LEVEL: "34"
+      ANDROID_BUILD_TOOLS: "34.0.0"
       GRADLE_USER_HOME: /tmp/ravakwp/gradle-home
+      PYTHONUNBUFFERED: "1"
 
     steps:
-      - name: Show build info
+      - name: Validate inputs and required secrets
+        shell: bash
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+          TRACE_NOTE: ${{ inputs.trace }}
         run: |
-          echo "RavakWP build_id = ${{ github.event.inputs.build_id }}"
-          echo "trace            = ${{ github.event.inputs.trace }}"
+          set -euo pipefail
+          : "${BUILD_ID:?Missing workflow_dispatch input: build_id}"
+          : "${RVK_SITE_URL:?Missing repository secret: RVK_SITE_URL}"
+          : "${RVK_STORE_KEY:?Missing repository secret: RVK_STORE_KEY}"
+          : "${RVK_HMAC_KEY:?Missing repository secret: RVK_HMAC_KEY}"
+
+          # Reject control characters/newlines. The value is passed through env,
+          # never interpolated directly into shell source.
+          if [[ "$BUILD_ID" =~ [^a-zA-Z0-9._:-] ]]; then
+            echo "::error::build_id contains unsupported characters"
+            exit 1
+          fi
+          if [[ ! "$RVK_SITE_URL" =~ ^https:// ]]; then
+            echo "::error::RVK_SITE_URL must use HTTPS"
+            exit 1
+          fi
+          echo "RavakWP build_id = $BUILD_ID"
+          echo "trace supplied  = $([[ -n "${TRACE_NOTE:-}" ]] && echo yes || echo no)"
           echo "runner           = $GITHUB_RUN_ID"
 
       - name: Set up JDK 17 (Temurin)
@@ -67,33 +85,55 @@ jobs:
         with:
           gradle-version: "8.7"
 
-      - name: Ensure Android SDK packages (platform 34 / build-tools 34)
+      - name: Ensure Android SDK packages
+        shell: bash
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            "platform-tools" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$SDKMANAGER" ]]; then
+            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -print -quit 2>/dev/null || true)"
+          fi
+          if [[ -z "$SDKMANAGER" || ! -x "$SDKMANAGER" ]]; then
+            echo "::error::Android sdkmanager not found under $ANDROID_HOME"
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}"
+          echo "Android SDK packages installed"
 
-      - name: Download runner bundle from WordPress (HMAC-signed)
+      - name: Download runner bundle from WordPress (HMAC-authenticated request)
+        shell: bash
         env:
-          BUILD_ID: ${{ github.event.inputs.build_id }}
+          BUILD_ID: ${{ inputs.build_id }}
         run: |
+          set -euo pipefail
           mkdir -p /tmp/rvk-gh-runner
           python3 - <<'PY'
-          import hashlib, hmac, os, time, urllib.request, urllib.error, zipfile, io
+          import hashlib
+          import hmac
+          import io
+          import os
+          import pathlib
+          import stat
+          import time
+          import urllib.error
+          import urllib.request
+          import zipfile
 
-          site  = os.environ["RVK_SITE_URL"].strip().rstrip("/")
+          site = os.environ["RVK_SITE_URL"].strip().rstrip("/")
           store = os.environ["RVK_STORE_KEY"].strip()
-          key   = os.environ["RVK_HMAC_KEY"].strip()
-          ts    = str(int(time.time()))
-          sig   = hmac.new(key.encode(), f"{ts}.".encode(), hashlib.sha256).hexdigest()
+          key = os.environ["RVK_HMAC_KEY"].strip()
+          if not site or not store or not key:
+              raise SystemExit("Missing RVK_SITE_URL, RVK_STORE_KEY, or RVK_HMAC_KEY")
 
-          # v1.2.3: a generic User-Agent + "Accept-Encoding: identity" stop
-          # CDNs/WAFs (ArvanCloud, Cloudflare, ...) from answering a python
-          # client with an HTML challenge page instead of the zip — the exact
-          # cause of "bundle download failed: HTTP 200" (200 = HTML, not zip).
+          ts = str(int(time.time()))
+          sig = hmac.new(key.encode(), f"{ts}.".encode(), hashlib.sha256).hexdigest()
           headers = {
-              "User-Agent": "ravakwp-gh-runner/1.2 (WordPress plugin)",
-              "Accept": "application/zip, */*",
+              "User-Agent": "ravakwp-gh-runner/1.3 (WordPress plugin)",
+              "Accept": "application/zip, application/octet-stream",
               "Accept-Encoding": "identity",
               "X-RVK-Worker": store,
               "X-RVK-Timestamp": ts,
@@ -102,83 +142,102 @@ jobs:
 
           def describe(status, hdrs, data):
               ctype = hdrs.get("Content-Type", "?")
-              cenc  = hdrs.get("Content-Encoding", "-")
-              head  = data[:300]
-              text  = "".join(chr(b) if 32 <= b < 127 or b in (9, 10, 13) else "." for b in head)
-              print(f"    status={status} content-type={ctype} content-encoding={cenc} bytes={len(data)}")
-              print(f"    body[0:300]={text!r}")
+              head = data[:300]
+              preview = "".join(chr(b) if 32 <= b < 127 or b in (9, 10, 13) else "." for b in head)
+              print(f"    status={status} content-type={ctype} bytes={len(data)}")
+              print(f"    body[0:300]={preview!r}")
 
-          # Pretty permalinks first; ?rest_route= fallback covers plain
-          # permalink setups where /wp-json/... returns the homepage (200 HTML).
           candidates = [
               f"{site}/wp-json/ravakwp/v1/gh/bundle",
               f"{site}/?rest_route=/ravakwp/v1/gh/bundle",
           ]
-
           data = b""
           for url in candidates:
               print(f"[bundle] GET {url}")
               try:
                   req = urllib.request.Request(url, method="GET", headers=headers)
-                  with urllib.request.urlopen(req, timeout=60) as r:
-                      status, hdrs, data = r.status, dict(r.headers), r.read()
-              except urllib.error.HTTPError as e:
-                  print(f"[bundle] HTTPError {e.code}")
-                  describe(e.code, dict(e.headers or {}), e.read())
-                  data = b""
+                  with urllib.request.urlopen(req, timeout=60) as response:
+                      status, hdrs, candidate = response.status, dict(response.headers), response.read()
+              except urllib.error.HTTPError as exc:
+                  print(f"[bundle] HTTPError {exc.code}")
+                  describe(exc.code, dict(exc.headers or {}), exc.read())
                   continue
               except Exception as exc:
-                  print(f"[bundle] request failed: {exc}")
-                  data = b""
+                  print(f"[bundle] request failed: {type(exc).__name__}: {exc}")
                   continue
 
-              if status == 200 and data.startswith(b"PK"):
-                  print(f"[bundle] received zip: {len(data)} bytes")
+              if status == 200 and zipfile.is_zipfile(io.BytesIO(candidate)):
+                  data = candidate
+                  print(f"[bundle] valid ZIP received: {len(data)} bytes")
                   break
-
-              print("[bundle] response is NOT a zip — diagnostics:")
-              describe(status, hdrs, data)
-              data = b""
+              print("[bundle] response is not a valid ZIP:")
+              describe(status, hdrs, candidate)
 
           if not data:
               raise SystemExit(
-                  "bundle download failed: the site never returned a zip. "
-                  "Read the diagnostics above. If content-type is text/html, "
-                  "a CDN/WAF (ArvanCloud/Cloudflare) or a maintenance/security "
-                  "plugin is intercepting /wp-json/* — whitelist that path and "
-                  "re-run the job."
+                  "Runner bundle download failed: neither REST URL returned a valid ZIP. "
+                  "Check WordPress REST routing, CDN/WAF rules, and the three repository secrets."
               )
 
-          try:
-              zipfile.ZipFile(io.BytesIO(data)).extractall("/tmp/rvk-gh-runner")
-          except zipfile.BadZipFile as exc:
-              raise SystemExit(f"bundle downloaded ({len(data)} bytes) but zip is invalid: {exc}")
-          print("bundle extracted OK")
+          destination = pathlib.Path("/tmp/rvk-gh-runner").resolve()
+          max_total = 1024 * 1024 * 1024  # 1 GiB uncompressed safety limit
+          total = 0
+          with zipfile.ZipFile(io.BytesIO(data)) as archive:
+              members = archive.infolist()
+              for member in members:
+                  name = member.filename
+                  target = (destination / name).resolve()
+                  if target != destination and destination not in target.parents:
+                      raise SystemExit(f"Unsafe ZIP member path rejected: {name!r}")
+                  mode = member.external_attr >> 16
+                  if stat.S_ISLNK(mode):
+                      raise SystemExit(f"Symlink in runner ZIP rejected: {name!r}")
+                  total += member.file_size
+                  if total > max_total:
+                      raise SystemExit("Runner ZIP exceeds 1 GiB uncompressed safety limit")
+              archive.extractall(destination)
+
+          runner = destination / "ravakwp-gh-runner" / "runner.py"
+          if not runner.is_file():
+              raise SystemExit(
+                  "ZIP is valid but expected ravakwp-gh-runner/runner.py is missing. "
+                  "Check the bundle directory layout generated by the WordPress plugin."
+              )
+          print("Runner bundle extracted and layout verified")
           PY
 
-      - name: Install runner Python dependencies (requests + Pillow)
+      - name: Install runner Python dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           python3 -m pip install --quiet --disable-pip-version-check --upgrade pip
           REQ=/tmp/rvk-gh-runner/ravakwp-gh-runner/requirements.txt
-          if [ -f "$REQ" ]; then
+          if [[ -f "$REQ" ]]; then
             python3 -m pip install --quiet --disable-pip-version-check -r "$REQ"
           else
-            python3 -m pip install --quiet --disable-pip-version-check "requests>=2.31" "Pillow>=10.0"
+            python3 -m pip install --quiet --disable-pip-version-check "requests>=2.31,<3" "Pillow>=10,<13"
           fi
-          python3 -c "import requests, PIL; print('runner deps OK: requests', requests.__version__, '| Pillow', PIL.__version__)"
+          python3 -c "import requests, PIL; print('runner deps OK:', requests.__version__, '| Pillow', PIL.__version__)"
 
       - name: Run build (claim → compile → sign → deliver)
+        shell: bash
         env:
-          BUILD_ID: ${{ github.event.inputs.build_id }}
+          BUILD_ID: ${{ inputs.build_id }}
         run: |
-          python3 /tmp/rvk-gh-runner/ravakwp-gh-runner/runner.py \
+          set -euo pipefail
+          RUNNER=/tmp/rvk-gh-runner/ravakwp-gh-runner/runner.py
+          test -f "$RUNNER"
+          python3 "$RUNNER" \
             --build-id "$BUILD_ID" \
             --run-id "$GITHUB_RUN_ID" \
             --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
       - name: Result
         if: always()
+        shell: bash
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
         run: |
-          echo "RavakWP build ${{ github.event.inputs.build_id }} finished."
-          echo "APK/AAB (if the build completed) are downloadable from the WordPress panel:"
+          echo "RavakWP build ${BUILD_ID:-unknown} finished."
+          echo "APK/AAB (if the build completed) are downloadable from the WordPress panel."
           echo "WordPress → RavakWP App Builder → Build"
