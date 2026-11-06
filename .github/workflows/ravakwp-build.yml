@@ -156,6 +156,17 @@ jobs:
           print("bundle extracted OK")
           PY
 
+      - name: Install runner Python dependencies (requests + Pillow)
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check --upgrade pip
+          REQ=/tmp/rvk-gh-runner/ravakwp-gh-runner/requirements.txt
+          if [ -f "$REQ" ]; then
+            python3 -m pip install --quiet --disable-pip-version-check -r "$REQ"
+          else
+            python3 -m pip install --quiet --disable-pip-version-check "requests>=2.31" "Pillow>=10.0"
+          fi
+          python3 -c "import requests, PIL; print('runner deps OK: requests', requests.__version__, '| Pillow', PIL.__version__)"
+
       - name: Run build (claim → compile → sign → deliver)
         env:
           BUILD_ID: ${{ github.event.inputs.build_id }}
